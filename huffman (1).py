@@ -1,367 +1,274 @@
-"""
-Huffman Coding - File Compression (Advanced Data Structures mini project)
+// huffman.h - Huffman coding with canonical codes (header-only)
+//
+// File format "HUF2" (identical to the Python version, files are interchangeable):
+//   4 bytes  magic "HUF2"
+//   8 bytes  original size, big-endian
+//   2 bytes  number of distinct symbols n, big-endian
+//   n * 2    (symbol, code length)
+//   rest     canonical-Huffman bit stream, zero-padded to a whole byte
+#pragma once
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cstring>
+#include <deque>
+#include <stdexcept>
+#include <string>
+#include <utility>
+#include <vector>
 
-Data structures implemented from scratch (no heapq):
-    1. MinHeap       - array-based binary heap
-    2. PairingHeap   - pointer-based mergeable heap (amortized O(1) insert/meld)
-    3. Node          - Huffman tree, also reused as a binary decode trie
-    4. BitWriter     - bit-level output buffer
-    5. dict          - frequency table and code table (hash maps)
+#include "heaps.h"
 
-Also uses canonical Huffman codes, so the header stores only code LENGTHS
-(2 bytes per symbol) instead of full frequencies (5 bytes per symbol).
+namespace huff {
 
-Usage:
-    python huffman.py compress   input.txt  output.huf [--heap binary|pairing]
-    python huffman.py decompress output.huf restored.txt
-    python huffman.py codes      input.txt          # canonical code table + entropy
-    python huffman.py bench                         # binary heap vs pairing heap
-    python huffman.py test                          # round-trip self tests
+enum class HeapKind { Binary, Pairing };
 
-File format (.huf):
-    4 bytes   magic  b"HUF2"
-    8 bytes   original size in bytes
-    2 bytes   number of distinct symbols n
-    n * 2     (symbol: 1 byte, code length: 1 byte)
-    rest      canonical-Huffman bit stream, zero-padded to a whole byte
-"""
-import math
-import os
-import random
-import struct
-import sys
-import time
-from collections import Counter
+// Codes longer than this are rejected. Reaching a depth of 56 would need an
+// input of hundreds of gigabytes with Fibonacci-like frequencies.
+constexpr int kMaxCodeLen = 56;
+inline constexpr char kMagic[4] = {'H', 'U', 'F', '2'};
 
-MAGIC = b"HUF2"
+// ---------------------------------------------------------------------
+// Huffman tree node (also reused as a binary trie node by the decoder)
+// ---------------------------------------------------------------------
+struct Node {
+    int sym = -1;  // byte value for a leaf, -1 for an internal node
+    std::uint64_t freq = 0;
+    Node* left = nullptr;
+    Node* right = nullptr;
+};
 
+// Owns every Node. A deque never moves existing elements, so pointers stay valid.
+class NodePool {
+    std::deque<Node> store_;
 
-# ======================================================================
-# Data structure 1: binary min-heap (array-based)
-# parent(i) = (i-1)//2, children = 2i+1, 2i+2
-# push: O(log n)   pop: O(log n)
-# ======================================================================
-class MinHeap:
-    def __init__(self):
-        self.a = []
+public:
+    Node* make() {
+        store_.emplace_back();
+        return &store_.back();
+    }
+    Node* make(int sym, std::uint64_t freq, Node* l = nullptr, Node* r = nullptr) {
+        Node* n = make();
+        n->sym = sym;
+        n->freq = freq;
+        n->left = l;
+        n->right = r;
+        return n;
+    }
+};
 
-    def __len__(self):
-        return len(self.a)
+using FreqTable = std::array<std::uint64_t, 256>;
+using LengthTable = std::array<std::uint8_t, 256>;
+struct Code {
+    std::uint64_t bits = 0;
+    int len = 0;
+};
+using CodeTable = std::array<Code, 256>;
 
-    def push(self, x):
-        a = self.a
-        a.append(x)
-        i = len(a) - 1
-        while i > 0:                       # sift up
-            p = (i - 1) // 2
-            if a[i] < a[p]:
-                a[i], a[p] = a[p], a[i]
-                i = p
-            else:
-                break
+// ---------------------------------------------------------------------
+// Tree construction (greedy: merge the two lightest trees)
+// ---------------------------------------------------------------------
+struct Item {  // what goes into the heap
+    std::uint64_t freq;
+    std::uint32_t order;  // tie-breaker: makes the order total and deterministic
+    Node* node;
+    bool operator<(const Item& o) const {
+        return freq != o.freq ? freq < o.freq : order < o.order;
+    }
+};
 
-    def pop(self):
-        a = self.a
-        top = a[0]
-        last = a.pop()
-        if a:
-            a[0] = last
-            i, n = 0, len(a)
-            while True:                    # sift down
-                l, r, m = 2 * i + 1, 2 * i + 2, i
-                if l < n and a[l] < a[m]:
-                    m = l
-                if r < n and a[r] < a[m]:
-                    m = r
-                if m == i:
-                    break
-                a[i], a[m] = a[m], a[i]
-                i = m
-        return top
+inline FreqTable count_freq(const std::vector<std::uint8_t>& data) {
+    FreqTable f{};
+    for (std::uint8_t b : data) ++f[b];
+    return f;
+}
 
+template <typename Heap>
+Node* build_tree_with(const FreqTable& freq, NodePool& pool) {
+    Heap heap;
+    std::uint32_t order = 0;
+    for (int s = 0; s < 256; ++s)
+        if (freq[s]) heap.push(Item{freq[s], order++, pool.make(s, freq[s])});
+    if (heap.empty()) return nullptr;
+    while (heap.size() > 1) {
+        Item a = heap.pop();
+        Item b = heap.pop();
+        std::uint64_t f = a.freq + b.freq;
+        heap.push(Item{f, order++, pool.make(-1, f, a.node, b.node)});
+    }
+    return heap.pop().node;
+}
 
-# ======================================================================
-# Data structure 2: pairing heap (heap-ordered multiway tree)
-# push / meld: O(1)   pop: O(log n) amortized (two-pass pairing)
-# ======================================================================
-class _PNode:
-    __slots__ = ("item", "kids")
+inline Node* build_tree(const FreqTable& freq, NodePool& pool, HeapKind kind) {
+    return kind == HeapKind::Binary ? build_tree_with<MinHeap<Item>>(freq, pool)
+                                    : build_tree_with<PairingHeap<Item>>(freq, pool);
+}
 
-    def __init__(self, item):
-        self.item = item
-        self.kids = []
+// Depth of each leaf = its code length (0 means the symbol does not occur).
+inline LengthTable code_lengths(const Node* root) {
+    LengthTable len{};
+    if (!root) return len;
+    if (root->sym >= 0) {  // only one distinct byte in the file
+        len[root->sym] = 1;
+        return len;
+    }
+    std::vector<std::pair<const Node*, int>> stack{{root, 0}};
+    while (!stack.empty()) {
+        auto [node, d] = stack.back();
+        stack.pop_back();
+        if (node->sym >= 0) {
+            if (d > kMaxCodeLen) throw std::runtime_error("code length exceeds supported maximum");
+            len[node->sym] = static_cast<std::uint8_t>(d);
+        } else {
+            stack.push_back({node->left, d + 1});
+            stack.push_back({node->right, d + 1});
+        }
+    }
+    return len;
+}
 
+// Canonical codes: sort by (length, symbol), count upward. The decoder can
+// rebuild exactly the same codes from the lengths alone.
+inline CodeTable canonical_codes(const LengthTable& len) {
+    std::vector<int> syms;
+    for (int s = 0; s < 256; ++s)
+        if (len[s]) syms.push_back(s);
+    std::sort(syms.begin(), syms.end(), [&](int a, int b) {
+        return len[a] != len[b] ? len[a] < len[b] : a < b;
+    });
+    CodeTable codes{};
+    std::uint64_t code = 0;
+    int prev = 0;
+    for (int s : syms) {
+        code <<= (len[s] - prev);
+        codes[s] = Code{code, len[s]};
+        ++code;
+        prev = len[s];
+    }
+    return codes;
+}
 
-class PairingHeap:
-    def __init__(self):
-        self.root = None
-        self.n = 0
+// Insert every code into a binary trie; leaves hold the symbol.
+inline Node* build_decode_trie(const CodeTable& codes, NodePool& pool) {
+    Node* root = pool.make();
+    for (int s = 0; s < 256; ++s) {
+        if (!codes[s].len) continue;
+        Node* node = root;
+        for (int i = codes[s].len - 1; i >= 0; --i) {
+            Node*& slot = ((codes[s].bits >> i) & 1) ? node->right : node->left;
+            if (!slot) slot = pool.make();
+            node = slot;
+        }
+        node->sym = s;
+    }
+    return root;
+}
 
-    def __len__(self):
-        return self.n
+// ---------------------------------------------------------------------
+// Bit-level writer
+// ---------------------------------------------------------------------
+class BitWriter {
+    std::vector<std::uint8_t> buf_;
+    std::uint64_t acc_ = 0;
+    int n_ = 0;  // number of pending bits in acc_ (always < 8 between calls)
 
-    @staticmethod
-    def _meld(a, b):
-        if a is None:
-            return b
-        if b is None:
-            return a
-        if b.item < a.item:
-            a, b = b, a
-        a.kids.append(b)                   # larger root becomes a child
-        return a
+public:
+    void write(std::uint64_t code, int len) {
+        acc_ = (acc_ << len) | code;
+        n_ += len;
+        while (n_ >= 8) {
+            n_ -= 8;
+            buf_.push_back(static_cast<std::uint8_t>((acc_ >> n_) & 0xFF));
+        }
+        acc_ &= (1ULL << n_) - 1;
+    }
+    std::vector<std::uint8_t> finish() {
+        if (n_) {
+            buf_.push_back(static_cast<std::uint8_t>((acc_ << (8 - n_)) & 0xFF));
+            acc_ = 0;
+            n_ = 0;
+        }
+        return std::move(buf_);
+    }
+};
 
-    def push(self, x):
-        self.root = self._meld(self.root, _PNode(x))
-        self.n += 1
+// ---------------------------------------------------------------------
+// Compress / decompress
+// ---------------------------------------------------------------------
+inline std::vector<std::uint8_t> compress(const std::vector<std::uint8_t>& data,
+                                          HeapKind kind = HeapKind::Binary) {
+    std::vector<std::uint8_t> out(kMagic, kMagic + 4);
+    auto put_be = [&](std::uint64_t v, int bytes) {
+        for (int i = bytes - 1; i >= 0; --i) out.push_back(static_cast<std::uint8_t>((v >> (8 * i)) & 0xFF));
+    };
+    if (data.empty()) {
+        put_be(0, 8);
+        put_be(0, 2);
+        return out;
+    }
+    FreqTable freq = count_freq(data);
+    NodePool pool;
+    LengthTable len = code_lengths(build_tree(freq, pool, kind));
+    CodeTable codes = canonical_codes(len);
 
-    def pop(self):
-        if self.root is None:
-            raise IndexError("pop from empty heap")
-        r = self.root
-        kids = r.kids
-        # pass 1: meld children in pairs, left to right
-        paired = [self._meld(kids[i], kids[i + 1]) if i + 1 < len(kids) else kids[i]
-                  for i in range(0, len(kids), 2)]
-        # pass 2: meld the results right to left
-        new = None
-        for t in reversed(paired):
-            new = self._meld(new, t)
-        self.root = new
-        self.n -= 1
-        return r.item
+    int n = 0;
+    for (int s = 0; s < 256; ++s)
+        if (len[s]) ++n;
+    put_be(data.size(), 8);
+    put_be(static_cast<std::uint64_t>(n), 2);
+    for (int s = 0; s < 256; ++s)
+        if (len[s]) {
+            out.push_back(static_cast<std::uint8_t>(s));
+            out.push_back(len[s]);
+        }
 
+    BitWriter w;
+    for (std::uint8_t b : data) w.write(codes[b].bits, codes[b].len);
+    std::vector<std::uint8_t> payload = w.finish();
+    out.insert(out.end(), payload.begin(), payload.end());
+    return out;
+}
 
-HEAPS = {"binary": MinHeap, "pairing": PairingHeap}
+inline std::vector<std::uint8_t> decompress(const std::vector<std::uint8_t>& blob) {
+    if (blob.size() < 14 || std::memcmp(blob.data(), kMagic, 4) != 0)
+        throw std::runtime_error("Not a HUF2 file");
+    auto get_be = [&](std::size_t off, int bytes) {
+        std::uint64_t v = 0;
+        for (int i = 0; i < bytes; ++i) v = (v << 8) | blob[off + i];
+        return v;
+    };
+    std::uint64_t size = get_be(4, 8);
+    std::size_t n = static_cast<std::size_t>(get_be(12, 2));
+    if (size == 0) return {};
 
+    std::size_t pos = 14;
+    if (n == 0 || n > 256 || blob.size() < pos + 2 * n) throw std::runtime_error("Corrupt header");
+    LengthTable len{};
+    for (std::size_t i = 0; i < n; ++i) {
+        int l = blob[pos + 2 * i + 1];
+        if (l < 1 || l > kMaxCodeLen) throw std::runtime_error("Corrupt header");
+        len[blob[pos + 2 * i]] = static_cast<std::uint8_t>(l);
+    }
+    pos += 2 * n;
+    if (size > 8ULL * (blob.size() - pos)) throw std::runtime_error("Corrupt file");
 
-# ======================================================================
-# Data structure 3: Huffman tree / binary decode trie
-# ======================================================================
-class Node:
-    __slots__ = ("sym", "freq", "left", "right")
+    NodePool pool;
+    const Node* root = build_decode_trie(canonical_codes(len), pool);
+    std::vector<std::uint8_t> out;
+    out.reserve(static_cast<std::size_t>(size));
+    const Node* node = root;
+    for (std::size_t p = pos; p < blob.size(); ++p) {
+        for (int i = 7; i >= 0; --i) {
+            node = ((blob[p] >> i) & 1) ? node->right : node->left;
+            if (!node) throw std::runtime_error("Corrupt file");
+            if (node->sym >= 0) {
+                out.push_back(static_cast<std::uint8_t>(node->sym));
+                if (out.size() == size) return out;
+                node = root;
+            }
+        }
+    }
+    throw std::runtime_error("Unexpected end of data");
+}
 
-    def __init__(self, sym=None, freq=0, left=None, right=None):
-        self.sym, self.freq, self.left, self.right = sym, freq, left, right
-
-
-def build_tree(freq, heap_cls=MinHeap):
-    """Greedy Huffman construction: repeatedly merge the two lightest trees."""
-    heap = heap_cls()
-    for order, (sym, f) in enumerate(sorted(freq.items())):
-        heap.push((f, order, Node(sym, f)))     # 'order' breaks ties deterministically
-    order = len(freq)
-    while len(heap) > 1:
-        f1, _, a = heap.pop()
-        f2, _, b = heap.pop()
-        heap.push((f1 + f2, order, Node(None, f1 + f2, a, b)))
-        order += 1
-    return heap.pop()[2]
-
-
-def code_lengths(root):
-    """Depth of every leaf = its code length."""
-    if root.sym is not None:                    # only one distinct byte in the file
-        return {root.sym: 1}
-    lengths, stack = {}, [(root, 0)]
-    while stack:
-        node, d = stack.pop()
-        if node.sym is not None:
-            lengths[node.sym] = d
-        else:
-            stack.append((node.left, d + 1))
-            stack.append((node.right, d + 1))
-    return lengths
-
-
-def canonical_codes(lengths):
-    """Assign codes in (length, symbol) order: the decoder can rebuild them
-    from lengths alone."""
-    codes, code, prev = {}, 0, 0
-    for sym, ln in sorted(lengths.items(), key=lambda kv: (kv[1], kv[0])):
-        code <<= (ln - prev)
-        codes[sym] = (code, ln)
-        code += 1
-        prev = ln
-    return codes
-
-
-def build_decode_trie(codes):
-    """Insert every code into a binary trie; leaves hold the symbol."""
-    root = Node()
-    for sym, (code, ln) in codes.items():
-        node = root
-        for i in range(ln - 1, -1, -1):
-            bit = (code >> i) & 1
-            child = node.right if bit else node.left
-            if child is None:
-                child = Node()
-                if bit:
-                    node.right = child
-                else:
-                    node.left = child
-            node = child
-        node.sym = sym
-    return root
-
-
-# ======================================================================
-# Data structure 4: bit-level writer
-# ======================================================================
-class BitWriter:
-    def __init__(self):
-        self.buf, self.acc, self.n = bytearray(), 0, 0
-
-    def write(self, code, length):
-        self.acc = (self.acc << length) | code
-        self.n += length
-        while self.n >= 8:
-            self.n -= 8
-            self.buf.append((self.acc >> self.n) & 0xFF)
-        self.acc &= (1 << self.n) - 1
-
-    def finish(self):
-        if self.n:
-            self.buf.append((self.acc << (8 - self.n)) & 0xFF)
-            self.acc = self.n = 0
-        return bytes(self.buf)
-
-
-# ======================================================================
-# Compress / decompress
-# ======================================================================
-def compress_bytes(data, heap_cls=MinHeap):
-    if not data:
-        return MAGIC + struct.pack(">QH", 0, 0)
-    freq = Counter(data)
-    lengths = code_lengths(build_tree(freq, heap_cls))
-    codes = canonical_codes(lengths)
-    w = BitWriter()
-    for b in data:
-        w.write(*codes[b])
-    header = MAGIC + struct.pack(">QH", len(data), len(lengths))
-    header += b"".join(bytes((s, l)) for s, l in sorted(lengths.items()))
-    return header + w.finish()
-
-
-def decompress_bytes(blob):
-    if blob[:4] != MAGIC:
-        raise ValueError("Not a HUF2 file")
-    size, n = struct.unpack(">QH", blob[4:14])
-    if size == 0:
-        return b""
-    pos = 14
-    lengths = {blob[pos + 2 * i]: blob[pos + 2 * i + 1] for i in range(n)}
-    pos += 2 * n
-    root = build_decode_trie(canonical_codes(lengths))
-    out, node = bytearray(), root
-    for byte in blob[pos:]:
-        for i in range(7, -1, -1):
-            node = node.right if (byte >> i) & 1 else node.left
-            if node is None:
-                raise ValueError("Corrupt file")
-            if node.sym is not None:
-                out.append(node.sym)
-                if len(out) == size:
-                    return bytes(out)
-                node = root
-    raise ValueError("Unexpected end of data")
-
-
-# ======================================================================
-# File helpers, analysis and CLI
-# ======================================================================
-def compress_file(src, dst, heap_cls):
-    data = open(src, "rb").read()
-    blob = compress_bytes(data, heap_cls)
-    open(dst, "wb").write(blob)
-    o, c = len(data), len(blob)
-    print(f"Original  : {o} bytes")
-    print(f"Compressed: {c} bytes")
-    if o:
-        print(f"Ratio     : {c / o:.1%} of original ({1 - c / o:.1%} saved)")
-
-
-def decompress_file(src, dst):
-    open(dst, "wb").write(decompress_bytes(open(src, "rb").read()))
-    print(f"Restored {dst}")
-
-
-def show_codes(src):
-    data = open(src, "rb").read()
-    freq = Counter(data)
-    codes = canonical_codes(code_lengths(build_tree(freq)))
-    print(f"{'char':>6} {'freq':>7}  canonical code")
-    for sym, (code, ln) in sorted(codes.items(), key=lambda kv: (kv[1][1], kv[0])):
-        ch = repr(chr(sym)) if 32 <= sym < 127 else f"0x{sym:02x}"
-        print(f"{ch:>6} {freq[sym]:>7}  {format(code, f'0{ln}b')}")
-    n = len(data)
-    avg = sum(freq[s] * codes[s][1] for s in codes) / n
-    entropy = -sum(f / n * math.log2(f / n) for f in freq.values())
-    print(f"\nEntropy H            : {entropy:.3f} bits/symbol")
-    print(f"Huffman average length: {avg:.3f} bits/symbol  (H <= avg < H + 1)")
-    print(f"Fixed-length encoding : 8.000 bits/symbol")
-
-
-def bench(n=100000):
-    data = [random.random() for _ in range(n)]
-    expected = sorted(data)
-    print(f"{n} pushes + {n} pops (heap sort):")
-    for name, cls in HEAPS.items():
-        h, t = cls(), time.perf_counter()
-        for x in data:
-            h.push(x)
-        out = [h.pop() for _ in range(n)]
-        dt = time.perf_counter() - t
-        assert out == expected, f"{name} heap returned wrong order"
-        print(f"  {name:8} {dt:.3f}s  (sorted correctly)")
-
-
-def self_test():
-    cases = [
-        b"",
-        b"a",
-        b"aaaaaaaa",
-        b"abracadabra",
-        b"the quick brown fox jumps over the lazy dog " * 50,
-        bytes(range(256)) * 4,
-        os.urandom(5000),
-    ]
-    for i, data in enumerate(cases, 1):
-        outs = []
-        for name, cls in HEAPS.items():
-            blob = compress_bytes(data, cls)
-            assert decompress_bytes(blob) == data, f"case {i} failed with {name} heap"
-            outs.append(blob)
-        assert outs[0] == outs[1], "heaps produced different output"
-        print(f"case {i}: PASS  ({len(data)} -> {len(outs[0])} bytes, both heaps identical)")
-    for cls in HEAPS.values():
-        h, xs = cls(), [random.randint(0, 50) for _ in range(500)]
-        for x in xs:
-            h.push(x)
-        assert [h.pop() for _ in xs] == sorted(xs)
-    print("heap tests: PASS")
-    print("All tests passed.")
-
-
-if __name__ == "__main__":
-    args = sys.argv[1:]
-    heap_name = "binary"
-    if "--heap" in args:
-        i = args.index("--heap")
-        heap_name = args[i + 1] if i + 1 < len(args) else ""
-        del args[i:i + 2]
-    if heap_name not in HEAPS:
-        sys.exit("--heap must be 'binary' or 'pairing'")
-    if len(args) == 3 and args[0] == "compress":
-        compress_file(args[1], args[2], HEAPS[heap_name])
-    elif len(args) == 3 and args[0] == "decompress":
-        decompress_file(args[1], args[2])
-    elif len(args) == 2 and args[0] == "codes":
-        show_codes(args[1])
-    elif args == ["bench"]:
-        bench()
-    elif args == ["test"]:
-        self_test()
-    else:
-        print(__doc__)
+}  // namespace huff
