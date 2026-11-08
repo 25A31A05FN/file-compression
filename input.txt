@@ -1,0 +1,2 @@
+Huffman coding is a way to make data smaller.
+This example file can be compressed and then restored.

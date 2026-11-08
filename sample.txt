@@ -1,0 +1,2 @@
+AAAAABBBCC
+This is a small sample.

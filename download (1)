@@ -1,0 +1,10 @@
+build/
+cmake-build-*/
+*.exe
+*.obj
+*.o
+*.huff
+__pycache__/
+.DS_Store
+.vscode/
+.idea/
